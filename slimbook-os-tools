@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Slimbook OS tools.
+
+The script exposes its functionality through commands:
+
+    enable-hibernation
+        Enable hibernation on Ubuntu. It:
+
+          * detects the amount of RAM and the swap areas that are currently
+            active;
+          * creates a swap file the size of RAM when there is not enough disk
+            swap;
+          * keeps the swap file in /etc/fstab;
+          * configures the kernel resume parameters without replacing existing
+            GRUB options such as "quiet splash";
+          * regenerates the initramfs and the GRUB configuration.
+
+        It works with an existing swap partition as well as with an existing
+        swap file.
+
+Run the commands as root:
+
+    sudo ./slimbook-os-tools enable-hibernation
+"""
+
+import argparse
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
+class Color:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    BLUE = "\033[94m"
+    CYAN = "\033[96m"
+
+
+def _print(message, color="", prefix=""):
+    print(f"{color}{prefix}{message}{Color.RESET}", flush=True)
+
+
+def title(message):
+    _print(f"\n{message}", Color.BOLD + Color.CYAN)
+
+
+def info(message):
+    _print(message, Color.BLUE, "==> ")
+
+
+def success(message):
+    _print(message, Color.GREEN, "==> ")
+
+
+def warning(message):
+    _print(message, Color.YELLOW, "==> ")
+
+
+def error(message):
+    _print(message, Color.RED, "==> ")
+
+
+def detail(message):
+    _print(message, Color.DIM, "    ")
+
+
+# ---------------------------------------------------------------------------
+# System helpers
+# ---------------------------------------------------------------------------
+
+class HibernationError(Exception):
+    """A recoverable configuration error."""
+
+
+SWAPFILE = Path("/swapfile")
+GRUB_SCRIPT = Path("/etc/grub.d/99_slimbook-hibernation")
+GRUB_DROPIN = Path("/etc/default/grub.d/slimbook-hibernation.cfg")
+INITRAMFS_RESUME = Path("/etc/initramfs-tools/conf.d/resume")
+MANAGED_MARKER = "Managed by slimbook-hibernation"
+
+
+def run(command, check=True):
+    """Run a command and return the completed process."""
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        raise HibernationError(
+            f"Required command not found: {command[0]}"
+        ) from exc
+
+    if check and result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip()
+        raise HibernationError(
+            f"Command failed: {' '.join(command)}"
+            + (f"\n{message}" if message else "")
+        )
+    return result
+
+
+def command_exists(command):
+    return shutil.which(command) is not None
+
+
+def require_root():
+    if os.geteuid() != 0:
+        error("This script must be run as root (use sudo).")
+        sys.exit(1)
+
+
+def human_size(mebibytes):
+    if mebibytes >= 1024:
+        return f"{mebibytes / 1024:.1f} GiB"
+    return f"{mebibytes} MiB"
+
+
+def read_meminfo():
+    values = {}
+    with open("/proc/meminfo", encoding="utf-8") as meminfo:
+        for line in meminfo:
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            values[key] = int(value.split()[0])
+    return values
+
+
+def ram_size_mib():
+    """Return RAM size rounded up to whole MiB."""
+    meminfo = read_meminfo()
+    if "MemTotal" not in meminfo:
+        raise HibernationError("Could not read MemTotal from /proc/meminfo")
+    return math.ceil(meminfo["MemTotal"] / 1024)
+
+
+def is_ephemeral_swap(path):
+    """ZRAM/ZVOL cannot be used for hibernation."""
+    return path.startswith("/dev/zram") or path.startswith("/dev/zd")
+
+
+def active_swaps():
+    """Return the active disk swap areas listed in /proc/swaps."""
+    swaps = []
+    try:
+        with open("/proc/swaps", encoding="utf-8") as swaps_file:
+            next(swaps_file, None)
+            for line in swaps_file:
+                fields = line.split()
+                if len(fields) < 3:
+                    continue
+                path, swap_type, size_kib = fields[:3]
+                if is_ephemeral_swap(path):
+                    continue
+                swaps.append(
+                    {
+                        "path": path,
+                        "type": swap_type,
+                        "size_mib": math.ceil(int(size_kib) / 1024),
+                    }
+                )
+    except FileNotFoundError:
+        warning("/proc/swaps is not available; assuming no active swap.")
+    return swaps
+
+
+def largest_swap(swaps):
+    if not swaps:
+        return None
+    return max(swaps, key=lambda swap: swap["size_mib"])
+
+
+def write_managed_file(path, content, mode=None):
+    """Write a file managed by this script, backing up foreign files."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.exists():
+        try:
+            old_content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            old_content = ""
+
+        if old_content == content:
+            if mode is not None:
+                path.chmod(mode)
+            return False
+
+        if MANAGED_MARKER not in old_content:
+            backup = path.with_name(path.name + ".slimbook-hibernation.bak")
+            if not backup.exists():
+                shutil.copy2(path, backup)
+                warning(f"Backed up existing {path} to {backup}")
+
+    path.write_text(content, encoding="utf-8")
+    if mode is not None:
+        path.chmod(mode)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Swap handling
+# ---------------------------------------------------------------------------
+
+def fstab_has_swap(path):
+    try:
+        lines = Path("/etc/fstab").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise HibernationError(f"Could not read /etc/fstab: {exc}") from exc
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = stripped.split()
+        if fields and fields[0] == str(path):
+            return True
+    return False
+
+
+def add_swap_to_fstab(path):
+    if fstab_has_swap(path):
+        detail(f"{path} is already present in /etc/fstab")
+        return
+
+    fstab = Path("/etc/fstab")
+    try:
+        current = fstab.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HibernationError(f"Could not read /etc/fstab: {exc}") from exc
+
+    with fstab.open("a", encoding="utf-8") as fstab_file:
+        if current and not current.endswith("\n"):
+            fstab_file.write("\n")
+        fstab_file.write(f"# Added by slimbook-hibernation\n{path} none swap sw 0 0\n")
+
+    success(f"Added {path} to /etc/fstab")
+
+
+def swapoff_if_active(path):
+    active_paths = {swap["path"] for swap in active_swaps()}
+    if str(path) in active_paths:
+        info(f"Disabling the current swap area {path}")
+        run(["swapoff", str(path)])
+
+
+def create_swap_file(size_mib):
+    """Create, format and activate a swap file on the root filesystem."""
+    root = Path("/")
+    path = SWAPFILE
+
+    if path.exists() and not path.is_file():
+        raise HibernationError(f"{path} exists but is not a regular file")
+
+    existing_size = 0
+    if path.is_file():
+        existing_size = path.stat().st_size
+
+    needed_bytes = size_mib * 1024 * 1024
+    projected_free = shutil.disk_usage(root).free + existing_size
+    if projected_free < needed_bytes:
+        raise HibernationError(
+            f"Not enough free space on / to create a {human_size(size_mib)} "
+            f"swap file (free: {human_size(math.floor(projected_free / 1024 / 1024))})"
+        )
+
+    swapoff_if_active(path)
+
+    if path.exists():
+        warning(f"Replacing the existing {path}")
+        path.unlink()
+
+    fstype = run(["findmnt", "-n", "-o", "FSTYPE", "-T", "/"], check=False)
+    fstype = fstype.stdout.strip()
+    info(f"Creating a {human_size(size_mib)} swap file at {path}")
+
+    if fstype == "btrfs":
+        if command_exists("btrfs"):
+            result = run(
+                [
+                    "btrfs",
+                    "filesystem",
+                    "mkswapfile",
+                    "--size",
+                    f"{size_mib}M",
+                    str(path),
+                ],
+                check=False,
+            )
+            if result.returncode != 0:
+                warning("btrfs mkswapfile failed; trying the manual method")
+                if path.exists():
+                    path.unlink()
+                _create_with_fallocate(path, size_mib, set_nocow=True)
+        else:
+            _create_with_fallocate(path, size_mib, set_nocow=True)
+    else:
+        _create_with_fallocate(path, size_mib, set_nocow=False)
+
+    path.chmod(0o600)
+
+    # btrfs filesystem mkswapfile already formats the file.
+    if not _looks_like_swap(path):
+        run(["mkswap", str(path)])
+
+    run(["swapon", str(path)])
+    success(f"Created and activated {path}")
+
+    add_swap_to_fstab(path)
+    return path
+
+
+def _create_with_fallocate(path, size_mib, set_nocow):
+    if set_nocow:
+        path.touch()
+        if command_exists("chattr"):
+            run(["chattr", "+C", str(path)], check=False)
+
+    result = run(
+        ["fallocate", "-l", f"{size_mib}M", str(path)],
+        check=False,
+    )
+    if result.returncode != 0:
+        warning("fallocate failed; using dd instead (this can take a while)")
+        if path.exists():
+            path.unlink()
+        if set_nocow:
+            path.touch()
+            if command_exists("chattr"):
+                run(["chattr", "+C", str(path)], check=False)
+        run(
+            [
+                "dd",
+                "if=/dev/zero",
+                f"of={path}",
+                "bs=1M",
+                f"count={size_mib}",
+                "status=none",
+            ]
+        )
+
+
+def _looks_like_swap(path):
+    result = run(["blkid", "-p", "-s", "TYPE", "-o", "value", str(path)], check=False)
+    return result.stdout.strip() in {"swap", "swsuspend"}
+
+
+# ---------------------------------------------------------------------------
+# Resume detection
+# ---------------------------------------------------------------------------
+
+def block_identifier(device):
+    """Return a stable UUID/PARTUUID identifier for a block device."""
+    for tag in ("UUID", "PARTUUID"):
+        result = run(["blkid", "-s", tag, "-o", "value", device], check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            return f"{tag}={result.stdout.strip()}"
+    return device
+
+
+def resume_identifier_for_file(path):
+    """Return the filesystem identifier that owns a swap file."""
+    result = run(["findmnt", "-n", "-o", "UUID", "-T", str(path)], check=False)
+    if result.stdout.strip():
+        return f"UUID={result.stdout.strip()}"
+
+    source = run(
+        ["findmnt", "-n", "-o", "SOURCE", "-T", str(path)], check=False
+    ).stdout.strip()
+    if source:
+        return block_identifier(source)
+
+    raise HibernationError(f"Could not determine the filesystem UUID for {path}")
+
+
+def file_resume_offset(path):
+    """Return the physical offset of the first extent of a swap file."""
+    fstype = run(
+        ["findmnt", "-n", "-o", "FSTYPE", "-T", str(path)], check=False
+    ).stdout.strip()
+
+    if fstype == "btrfs":
+        result = run(
+            ["btrfs", "inspect-internal", "map-swapfile", "-r", str(path)],
+            check=False,
+        )
+        match = re.search(r"\d+", result.stdout)
+        if result.returncode == 0 and match:
+            return int(match.group(0))
+        raise HibernationError(f"Could not calculate the btrfs swap offset for {path}")
+
+    result = run(["filefrag", "-v", str(path)], check=False)
+    if result.returncode != 0:
+        raise HibernationError(
+            "Could not calculate the swap file offset with filefrag:\n"
+            + (result.stderr.strip() or result.stdout.strip())
+        )
+
+    for line in result.stdout.splitlines():
+        match = re.match(
+            r"^\s*0:\s+\d+\.\.\s*\d+:\s+(\d[\d.]*)\.\.",
+            line,
+        )
+        if match:
+            offset_blocks = int(match.group(1).replace(".", ""))
+            return _offset_in_pages(offset_blocks, path)
+
+    raise HibernationError(f"Could not parse the swap file offset for {path}")
+
+
+def _offset_in_pages(offset_blocks, path):
+    """Convert a filefrag filesystem-block offset to kernel page units."""
+    block_size = os.sysconf("SC_PAGE_SIZE")
+    result = run(["stat", "-f", "-c", "%S", str(path)], check=False)
+    try:
+        block_size = int(result.stdout.strip())
+    except ValueError:
+        pass
+    return offset_blocks * block_size // os.sysconf("SC_PAGE_SIZE")
+
+
+def resume_parameters(swap):
+    """Build the kernel resume parameters for an active swap area."""
+    path = swap["path"]
+
+    if swap["type"] == "file":
+        identifier = resume_identifier_for_file(path)
+        offset = file_resume_offset(path)
+        return (
+            [f"resume={identifier}", f"resume_offset={offset}"],
+            identifier,
+        )
+
+    identifier = block_identifier(path)
+    return [f"resume={identifier}"], identifier
+
+
+# ---------------------------------------------------------------------------
+# GRUB and initramfs configuration
+# ---------------------------------------------------------------------------
+
+def grub_supports_dropins():
+    """Check whether grub-mkconfig sources /etc/default/grub.d/*.cfg."""
+    try:
+        mkconfig = Path("/usr/sbin/grub-mkconfig").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return False
+    return "default/grub.d" in mkconfig
+
+
+def update_default_grub(parameters):
+    """Fallback for old GRUB versions without /etc/default/grub.d support."""
+    grub_file = Path("/etc/default/grub")
+    try:
+        content = grub_file.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HibernationError(f"Could not read {grub_file}: {exc}") from exc
+
+    backup = grub_file.with_name("grub.slimbook-hibernation.bak")
+    if not backup.exists():
+        shutil.copy2(grub_file, backup)
+        warning(f"Backed up {grub_file} to {backup}")
+
+    param_string = " ".join(parameters)
+    lines = content.splitlines(keepends=True)
+    changed = False
+
+    for index, line in enumerate(lines):
+        if not re.match(r"^\s*GRUB_CMDLINE_LINUX_DEFAULT=", line):
+            continue
+
+        match = re.match(
+            r'^(\s*GRUB_CMDLINE_LINUX_DEFAULT=)(["\'])(.*)\2(\s*)$', line
+        )
+        if match:
+            value = match.group(3)
+            value = re.sub(r"\s*\bresume=\S+", "", value)
+            value = re.sub(r"\s*\bresume_offset=\S+", "", value).strip()
+            lines[index] = (
+                f"{match.group(1)}{match.group(2)}{value} {param_string}"
+                f"{match.group(2)}{match.group(4)}"
+            )
+        else:
+            lines[index] = line.rstrip() + f" {param_string}\n"
+
+        changed = True
+        break
+
+    if not changed:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(f'GRUB_CMDLINE_LINUX_DEFAULT="{param_string}"\n')
+
+    grub_file.write_text("".join(lines), encoding="utf-8")
+    success(f"Updated {grub_file} without touching its other options")
+
+
+def configure_grub(parameters):
+    """Write the resume settings into GRUB's configuration directory."""
+    parameter_string = " ".join(parameters)
+
+    script_content = f"""#!/bin/sh
+# {MANAGED_MARKER} -- do not edit.
+#
+# The hibernation kernel parameters live here, in /etc/grub.d, as requested.
+# grub-mkconfig sources /etc/default/grub.d/*.cfg before running the scripts
+# in /etc/grub.d. The drop-in installed by this tool sources this file, so the
+# parameters are appended to the existing command line (keeping options such
+# as "quiet splash"). When update-grub executes this file it produces no output
+# on purpose.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT {parameter_string}"
+"""
+    write_managed_file(GRUB_SCRIPT, script_content, mode=0o755)
+    success(f"Configured hibernation in {GRUB_SCRIPT}")
+
+    if grub_supports_dropins():
+        dropin_content = f"""# {MANAGED_MARKER} -- do not edit.
+# grub-mkconfig sources this file, which loads the hibernation settings kept
+# in /etc/grub.d/99_slimbook-hibernation.
+. /etc/grub.d/99_slimbook-hibernation
+"""
+        write_managed_file(GRUB_DROPIN, dropin_content, mode=0o644)
+        detail(f"GRUB drop-in: {GRUB_DROPIN}")
+    else:
+        warning(
+            "This GRUB version does not read /etc/default/grub.d; "
+            "updating /etc/default/grub instead."
+        )
+        update_default_grub(parameters)
+
+
+def configure_initramfs(resume_identifier):
+    """Make initramfs-tools resume from the selected swap area."""
+    if not Path("/etc/initramfs-tools").exists():
+        warning("initramfs-tools was not found; skipping its resume configuration.")
+        return
+
+    content = (
+        f"# {MANAGED_MARKER} -- do not edit.\n"
+        f"RESUME={resume_identifier}\n"
+    )
+    changed = write_managed_file(INITRAMFS_RESUME, content, mode=0o644)
+    if changed:
+        success(f"Configured {INITRAMFS_RESUME}")
+    else:
+        detail(f"{INITRAMFS_RESUME} is already up to date")
+
+
+def regenerate_boot_files():
+    info("Updating GRUB")
+    if command_exists("update-grub"):
+        run(["update-grub"])
+    elif command_exists("grub-mkconfig"):
+        run(["grub-mkconfig", "-o", "/boot/grub/grub.cfg"])
+    else:
+        warning("GRUB was not found; the boot configuration was not regenerated.")
+
+    info("Updating the initramfs")
+    if command_exists("update-initramfs"):
+        run(["update-initramfs", "-u", "-k", "all"])
+    else:
+        warning("update-initramfs was not found; the initramfs was not regenerated.")
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def enable_hibernation():
+    """Configure swap, GRUB and initramfs so that hibernation works."""
+    require_root()
+
+    title("Slimbook hibernation setup")
+
+    ram_mib = ram_size_mib()
+    swaps = active_swaps()
+    swap_total = sum(swap["size_mib"] for swap in swaps)
+
+    info(f"RAM: {human_size(ram_mib)}")
+    info(f"Active disk swap: {human_size(swap_total)}")
+    if swaps:
+        for swap in swaps:
+            detail(
+                f"{swap['path']} ({swap['type']}, {human_size(swap['size_mib'])})"
+            )
+
+    if swap_total < ram_mib:
+        warning(
+            f"Current swap ({human_size(swap_total)}) is smaller than RAM "
+            f"({human_size(ram_mib)})."
+        )
+        create_swap_file(ram_mib)
+        swaps = active_swaps()
+        swap_total = sum(swap["size_mib"] for swap in swaps)
+
+        if swap_total < ram_mib:
+            raise HibernationError(
+                "There is still not enough active swap after creating the swap file."
+            )
+    else:
+        success("There is already enough swap space for hibernation.")
+
+    target = largest_swap(swaps)
+    if target is None:
+        raise HibernationError("No usable disk swap area was found.")
+
+    success(
+        f"Using {target['path']} ({target['type']}, "
+        f"{human_size(target['size_mib'])}) as the resume swap area."
+    )
+    if target["size_mib"] < ram_mib:
+        warning(
+            "The resume swap area is smaller than RAM; hibernation may fail. "
+            "Consider disabling or enlarging the other swap areas and running "
+            "this script again."
+        )
+
+    parameters, resume_identifier = resume_parameters(target)
+    info("Resume parameters: " + " ".join(parameters))
+
+    configure_initramfs(resume_identifier)
+    configure_grub(parameters)
+    regenerate_boot_files()
+
+    title("Hibernation has been configured")
+    success("Reboot the computer before trying to hibernate.")
+    info("Then test it with: sudo systemctl hibernate")
+
+
+# ---------------------------------------------------------------------------
+# Command line interface
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="slimbook-os-tools",
+        description="Configure Slimbook laptops running Ubuntu.",
+        epilog=(
+            "Run '%(prog)s <command> --help' for more information "
+            "about a command."
+        ),
+    )
+    subparsers = parser.add_subparsers(
+        dest="command",
+        metavar="<command>",
+        required=True,
+    )
+
+    enable_parser = subparsers.add_parser(
+        "enable-hibernation",
+        help="configure hibernation (swap, GRUB and initramfs)",
+        description=(
+            "Configure the swap area, the kernel resume parameters, GRUB and "
+            "the initramfs so that the computer can hibernate."
+        ),
+    )
+    enable_parser.set_defaults(handler=enable_hibernation)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.handler()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except HibernationError as exc:
+        error(str(exc))
+        sys.exit(1)
+    except OSError as exc:
+        error(str(exc))
+        sys.exit(1)
+    except KeyboardInterrupt:
+        error("Interrupted.")
+        sys.exit(1)
