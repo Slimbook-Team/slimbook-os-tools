@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-FileCopyrightText: © 2026 Slimbook <dev@slimbook.com>
 """Slimbook OS tools.
 
 The script exposes its functionality through commands:
@@ -85,11 +86,11 @@ class HibernationError(Exception):
     """A recoverable configuration error."""
 
 
-SWAPFILE = Path("/swapfile")
+SWAPFILE = Path("/swapfile.slimbook")
 GRUB_SCRIPT = Path("/etc/grub.d/99_slimbook-hibernation")
 GRUB_DROPIN = Path("/etc/default/grub.d/slimbook-hibernation.cfg")
 INITRAMFS_RESUME = Path("/etc/initramfs-tools/conf.d/resume")
-MANAGED_MARKER = "Managed by slimbook-hibernation"
+MANAGED_MARKER = "Managed by slimbook-os-tools"
 
 
 def run(command, check=True):
