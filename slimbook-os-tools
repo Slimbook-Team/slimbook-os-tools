@@ -20,9 +20,15 @@ The script exposes its functionality through commands:
         It works with an existing swap partition as well as with an existing
         swap file.
 
+    upgrade-to-26
+        Upgrade an Ubuntu 24.04 system to 26.04. It first fully upgrades the
+        current system, then replaces the Slimbook apt source, points the
+        Ubuntu apt sources at 26.04 and runs a full system upgrade again.
+
 Run the commands as root:
 
     sudo ./slimbook-os-tools enable-hibernation
+    sudo ./slimbook-os-tools upgrade-to-26
 """
 
 import argparse
@@ -82,7 +88,7 @@ def detail(message):
 # System helpers
 # ---------------------------------------------------------------------------
 
-class HibernationError(Exception):
+class SlimbookError(Exception):
     """A recoverable configuration error."""
 
 
@@ -91,6 +97,35 @@ GRUB_SCRIPT = Path("/etc/grub.d/99_slimbook-hibernation")
 GRUB_DROPIN = Path("/etc/default/grub.d/slimbook-hibernation.cfg")
 INITRAMFS_RESUME = Path("/etc/initramfs-tools/conf.d/resume")
 MANAGED_MARKER = "Managed by slimbook-os-tools"
+
+APT_SOURCES_LIST = Path("/etc/apt/sources.list")
+APT_SOURCES_DIR = Path("/etc/apt/sources.list.d")
+SLIMBOOK_APT_LIST = APT_SOURCES_DIR / "slimbook.list"
+SLIMBOOK_APT_SOURCES = APT_SOURCES_DIR / "slimbook.sources"
+SLIMBOOK_26_SOURCES = """
+Types: deb
+URIs: https://archive.slimbook.com/26/
+Suites: slimbookos
+Components: main
+Signed-By: /etc/apt/trusted.gpg.d/slimbook.gpg
+
+Types: deb
+URIs: https://archive.slimbook.com/26/
+Suites: slimbookos-updates
+Components: main
+Signed-By: /etc/apt/trusted.gpg.d/slimbook.gpg
+
+Types: deb
+URIs: https://archive.slimbook.com/26/
+Suites: slimbookos-security
+Components: main
+Signed-By: /etc/apt/trusted.gpg.d/slimbook.gpg
+"""
+APT_BACKUP_SUFFIX = ".slimbook-os-tools.bak"
+UPGRADE_FROM_RELEASE = "24.04"
+UPGRADE_FROM_CODENAME = "noble"
+UPGRADE_TO_RELEASE = "26.04"
+UPGRADE_TO_CODENAME = "resolute"
 
 
 def run(command, check=True):
@@ -102,16 +137,30 @@ def run(command, check=True):
             capture_output=True,
         )
     except FileNotFoundError as exc:
-        raise HibernationError(
+        raise SlimbookError(
             f"Required command not found: {command[0]}"
         ) from exc
 
     if check and result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip()
-        raise HibernationError(
+        raise SlimbookError(
             f"Command failed: {' '.join(command)}"
             + (f"\n{message}" if message else "")
         )
+    return result
+
+
+def run_live(command):
+    """Run a command attached to the terminal so its progress is visible."""
+    try:
+        result = subprocess.run(command)
+    except FileNotFoundError as exc:
+        raise SlimbookError(
+            f"Required command not found: {command[0]}"
+        ) from exc
+
+    if result.returncode != 0:
+        raise SlimbookError(f"Command failed: {' '.join(command)}")
     return result
 
 
@@ -146,7 +195,7 @@ def ram_size_mib():
     """Return RAM size rounded up to whole MiB."""
     meminfo = read_meminfo()
     if "MemTotal" not in meminfo:
-        raise HibernationError("Could not read MemTotal from /proc/meminfo")
+        raise SlimbookError("Could not read MemTotal from /proc/meminfo")
     return math.ceil(meminfo["MemTotal"] / 1024)
 
 
@@ -221,7 +270,7 @@ def fstab_has_swap(path):
     try:
         lines = Path("/etc/fstab").read_text(encoding="utf-8").splitlines()
     except OSError as exc:
-        raise HibernationError(f"Could not read /etc/fstab: {exc}") from exc
+        raise SlimbookError(f"Could not read /etc/fstab: {exc}") from exc
 
     for line in lines:
         stripped = line.strip()
@@ -242,7 +291,7 @@ def add_swap_to_fstab(path):
     try:
         current = fstab.read_text(encoding="utf-8")
     except OSError as exc:
-        raise HibernationError(f"Could not read /etc/fstab: {exc}") from exc
+        raise SlimbookError(f"Could not read /etc/fstab: {exc}") from exc
 
     with fstab.open("a", encoding="utf-8") as fstab_file:
         if current and not current.endswith("\n"):
@@ -265,7 +314,7 @@ def create_swap_file(size_mib):
     path = SWAPFILE
 
     if path.exists() and not path.is_file():
-        raise HibernationError(f"{path} exists but is not a regular file")
+        raise SlimbookError(f"{path} exists but is not a regular file")
 
     existing_size = 0
     if path.is_file():
@@ -274,7 +323,7 @@ def create_swap_file(size_mib):
     needed_bytes = size_mib * 1024 * 1024
     projected_free = shutil.disk_usage(root).free + existing_size
     if projected_free < needed_bytes:
-        raise HibernationError(
+        raise SlimbookError(
             f"Not enough free space on / to create a {human_size(size_mib)} "
             f"swap file (free: {human_size(math.floor(projected_free / 1024 / 1024))})"
         )
@@ -385,7 +434,7 @@ def resume_identifier_for_file(path):
     if source:
         return block_identifier(source)
 
-    raise HibernationError(f"Could not determine the filesystem UUID for {path}")
+    raise SlimbookError(f"Could not determine the filesystem UUID for {path}")
 
 
 def file_resume_offset(path):
@@ -402,11 +451,11 @@ def file_resume_offset(path):
         match = re.search(r"\d+", result.stdout)
         if result.returncode == 0 and match:
             return int(match.group(0))
-        raise HibernationError(f"Could not calculate the btrfs swap offset for {path}")
+        raise SlimbookError(f"Could not calculate the btrfs swap offset for {path}")
 
     result = run(["filefrag", "-v", str(path)], check=False)
     if result.returncode != 0:
-        raise HibernationError(
+        raise SlimbookError(
             "Could not calculate the swap file offset with filefrag:\n"
             + (result.stderr.strip() or result.stdout.strip())
         )
@@ -420,7 +469,7 @@ def file_resume_offset(path):
             offset_blocks = int(match.group(1).replace(".", ""))
             return _offset_in_pages(offset_blocks, path)
 
-    raise HibernationError(f"Could not parse the swap file offset for {path}")
+    raise SlimbookError(f"Could not parse the swap file offset for {path}")
 
 
 def _offset_in_pages(offset_blocks, path):
@@ -471,7 +520,7 @@ def update_default_grub(parameters):
     try:
         content = grub_file.read_text(encoding="utf-8")
     except OSError as exc:
-        raise HibernationError(f"Could not read {grub_file}: {exc}") from exc
+        raise SlimbookError(f"Could not read {grub_file}: {exc}") from exc
 
     backup = grub_file.with_name("grub.slimbook-hibernation.bak")
     if not backup.exists():
@@ -580,6 +629,143 @@ def regenerate_boot_files():
 
 
 # ---------------------------------------------------------------------------
+# Ubuntu release upgrade
+# ---------------------------------------------------------------------------
+
+UBUNTU_SOURCE_HOST_RE = re.compile(
+    r"\b(?:[a-z0-9-]+\.)*ubuntu\.com\b",
+    re.IGNORECASE,
+)
+UBUNTU_SOURCE_MARKERS = (
+    "ubuntu-archive-keyring",
+    "ubuntu-keyring",
+)
+UBUNTU_SOURCE_NAMES = {"ubuntu.list", "ubuntu.sources"}
+
+
+def remove_slimbook_apt_list():
+    """Remove the old-style Slimbook apt source if it exists."""
+    if SLIMBOOK_APT_LIST.exists() or SLIMBOOK_APT_LIST.is_symlink():
+        SLIMBOOK_APT_LIST.unlink()
+        success(f"Removed {SLIMBOOK_APT_LIST}")
+    else:
+        detail(f"{SLIMBOOK_APT_LIST} is not present")
+
+
+def create_slimbook_apt_sources():
+    """Create an empty deb822 Slimbook apt source for later configuration."""
+    SLIMBOOK_APT_SOURCES.parent.mkdir(parents=True, exist_ok=True)
+
+    if SLIMBOOK_APT_SOURCES.exists() or SLIMBOOK_APT_SOURCES.is_symlink():
+        detail(f"{SLIMBOOK_APT_SOURCES} already exists; leaving it unchanged")
+        return
+
+    SLIMBOOK_APT_SOURCES.touch(mode=0o644)
+    SLIMBOOK_APT_SOURCES.chmod(0o644)
+    success(f"Created empty {SLIMBOOK_APT_SOURCES}")
+
+
+def apt_source_files():
+    """Return the apt source files that may contain Ubuntu repositories."""
+    files = []
+
+    if APT_SOURCES_LIST.is_file():
+        files.append(APT_SOURCES_LIST)
+
+    if APT_SOURCES_DIR.is_dir():
+        for path in sorted(APT_SOURCES_DIR.iterdir(), key=str):
+            if path.name in {SLIMBOOK_APT_LIST.name, SLIMBOOK_APT_SOURCES.name}:
+                continue
+            if path.suffix not in {".list", ".sources"}:
+                continue
+            if path.is_file():
+                files.append(path)
+
+    return files
+
+
+def is_ubuntu_source(path, content):
+    """Check whether an apt source file references an Ubuntu repository."""
+    if UBUNTU_SOURCE_HOST_RE.search(content):
+        return True
+    if any(marker in content for marker in UBUNTU_SOURCE_MARKERS):
+        return True
+    return path.name in UBUNTU_SOURCE_NAMES
+
+
+def rewrite_ubuntu_source(content):
+    """Point the Ubuntu suites and release references at 26.04."""
+    content = re.sub(
+        rf"\b{re.escape(UPGRADE_FROM_CODENAME)}\b",
+        UPGRADE_TO_CODENAME,
+        content,
+    )
+    return re.sub(
+        rf"\b{re.escape(UPGRADE_FROM_RELEASE)}\b",
+        UPGRADE_TO_RELEASE,
+        content,
+    )
+
+
+def backup_apt_source(path):
+    backup = path.with_name(path.name + APT_BACKUP_SUFFIX)
+    if not backup.exists():
+        shutil.copy2(path, backup)
+        warning(f"Backed up {path} to {backup}")
+
+
+def update_ubuntu_sources():
+    """Rewrite the Ubuntu apt sources from 24.04 (noble) to 26.04 (resolute)."""
+    matched = 0
+    updated = 0
+
+    for path in apt_source_files():
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SlimbookError(f"Could not read {path}: {exc}") from exc
+
+        if not is_ubuntu_source(path, content):
+            continue
+
+        matched += 1
+        new_content = rewrite_ubuntu_source(content)
+
+        if new_content == content:
+            detail(
+                f"{path} already targets Ubuntu {UPGRADE_TO_RELEASE} "
+                f"({UPGRADE_TO_CODENAME})"
+            )
+            continue
+
+        backup_apt_source(path)
+        path.write_text(new_content, encoding="utf-8")
+        success(
+            f"Updated {path} to Ubuntu {UPGRADE_TO_RELEASE} "
+            f"({UPGRADE_TO_CODENAME})"
+        )
+        updated += 1
+
+    if matched == 0:
+        raise SlimbookError(
+            "No Ubuntu apt source files were found; refusing to upgrade."
+        )
+    if updated == 0:
+        success(
+            f"The Ubuntu apt sources already target {UPGRADE_TO_RELEASE}."
+        )
+
+
+def update_and_full_upgrade():
+    """Refresh the apt package lists and upgrade every installed package."""
+    info("Refreshing the apt package lists")
+    run_live(["apt-get", "update"])
+
+    info("Upgrading the installed system (this can take a while)")
+    run_live(["apt-get", "-y", "full-upgrade"])
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -611,7 +797,7 @@ def enable_hibernation():
         swap_total = sum(swap["size_mib"] for swap in swaps)
 
         if swap_total < ram_mib:
-            raise HibernationError(
+            raise SlimbookError(
                 "There is still not enough active swap after creating the swap file."
             )
     else:
@@ -619,7 +805,7 @@ def enable_hibernation():
 
     target = largest_swap(swaps)
     if target is None:
-        raise HibernationError("No usable disk swap area was found.")
+        raise SlimbookError("No usable disk swap area was found.")
 
     success(
         f"Using {target['path']} ({target['type']}, "
@@ -642,6 +828,28 @@ def enable_hibernation():
     title("Hibernation has been configured")
     success("Reboot the computer before trying to hibernate.")
     info("Then test it with: sudo systemctl hibernate")
+
+
+def upgrade_to_26():
+    """Upgrade the apt sources and installed system from Ubuntu 24.04 to 26.04."""
+    require_root()
+
+    title("Slimbook OS upgrade to Ubuntu 26.04")
+
+    title("Upgrading the current system before changing apt sources")
+    update_and_full_upgrade()
+
+    title("Switching apt sources to Ubuntu 26.04")
+    remove_slimbook_apt_list()
+    create_slimbook_apt_sources()
+    update_ubuntu_sources()
+
+    title("Upgrading the system from the new apt sources")
+    update_and_full_upgrade()
+
+    title("Ubuntu 26.04 upgrade finished")
+    success("Reboot the computer to finish the upgrade.")
+    info("Then check the release with: lsb_release -a")
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +881,17 @@ def build_parser():
     )
     enable_parser.set_defaults(handler=enable_hibernation)
 
+    upgrade_parser = subparsers.add_parser(
+        "upgrade-to-26",
+        help="upgrade the Ubuntu 24.04 system to 26.04",
+        description=(
+            "Fully upgrade the current system, replace the Slimbook apt "
+            "source, point the Ubuntu apt sources at 26.04 and run a full "
+            "system upgrade again."
+        ),
+    )
+    upgrade_parser.set_defaults(handler=upgrade_to_26)
+
     return parser
 
 
@@ -685,7 +904,7 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         main()
-    except HibernationError as exc:
+    except SlimbookError as exc:
         error(str(exc))
         sys.exit(1)
     except OSError as exc:
