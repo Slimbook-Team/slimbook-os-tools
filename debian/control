@@ -1,0 +1,13 @@
+Source: slimbook-os-tools
+Section: utils
+Priority: optional
+Maintainer: Slimbook <dev@slimbook.es>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.0
+Homepage: https://slimbook.es
+
+Package: slimbook-os-tools
+Architecture: all
+Description: Slimbook OS tools
+ Some handy OS tools for Slimbook OS
+
