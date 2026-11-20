@@ -653,16 +653,32 @@ def remove_slimbook_apt_list():
 
 
 def create_slimbook_apt_sources():
-    """Create an empty deb822 Slimbook apt source for later configuration."""
+    """Write the Slimbook 26 deb822 apt source."""
     SLIMBOOK_APT_SOURCES.parent.mkdir(parents=True, exist_ok=True)
 
-    if SLIMBOOK_APT_SOURCES.exists() or SLIMBOOK_APT_SOURCES.is_symlink():
-        detail(f"{SLIMBOOK_APT_SOURCES} already exists; leaving it unchanged")
-        return
+    content = SLIMBOOK_26_SOURCES.lstrip("\n")
+    if not content.endswith("\n"):
+        content += "\n"
 
-    SLIMBOOK_APT_SOURCES.touch(mode=0o644)
+    if SLIMBOOK_APT_SOURCES.exists() or SLIMBOOK_APT_SOURCES.is_symlink():
+        try:
+            current = SLIMBOOK_APT_SOURCES.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise SlimbookError(
+                f"Could not read {SLIMBOOK_APT_SOURCES}: {exc}"
+            ) from exc
+
+        if current == content:
+            SLIMBOOK_APT_SOURCES.chmod(0o644)
+            detail(f"{SLIMBOOK_APT_SOURCES} is already up to date")
+            return
+
+        backup_apt_source(SLIMBOOK_APT_SOURCES)
+        warning(f"Replacing existing {SLIMBOOK_APT_SOURCES}")
+
+    SLIMBOOK_APT_SOURCES.write_text(content, encoding="utf-8")
     SLIMBOOK_APT_SOURCES.chmod(0o644)
-    success(f"Created empty {SLIMBOOK_APT_SOURCES}")
+    success(f"Configured {SLIMBOOK_APT_SOURCES}")
 
 
 def apt_source_files():
